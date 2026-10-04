@@ -9,6 +9,7 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { ShippingOrder } from '../types/shippingOrder';
 import { autoVerdict, estimateEvapMm } from './brine';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
@@ -96,11 +97,12 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 卤水日观测（每池 2–4 条，密度随日期递增） ----------------
+  // 北-01 最新密度 1.118 ≥ 目标 1.115（可出卤）；南-04 最新密度 1.102 ≥ 目标 1.098（可出卤，但罐区容量不足会排队）
   const observations: Observation[] = [
     observation('obs-a1', SEED_IDS.pondA, '2026-08-20', 1.045, 28, 45, 2),
     observation('obs-a2', SEED_IDS.pondA, '2026-08-30', 1.062, 30, 43, 3),
     observation('obs-a3', SEED_IDS.pondA, '2026-09-10', 1.086, 29, 41, 2),
-    observation('obs-a4', SEED_IDS.pondA, '2026-09-22', 1.108, 26, 39, 3),
+    observation('obs-a4', SEED_IDS.pondA, '2026-09-22', 1.118, 26, 39, 3),
     observation('obs-b1', SEED_IDS.pondB, '2026-08-22', 1.112, 27, 40, 2),
     observation('obs-b2', SEED_IDS.pondB, '2026-09-02', 1.14, 29, 38, 3),
     observation('obs-b3', SEED_IDS.pondB, '2026-09-14', 1.168, 28, 36, 2),
@@ -110,7 +112,7 @@ export async function seedDatabase(): Promise<void> {
     observation('obs-d1', SEED_IDS.pondD, '2026-08-21', 1.038, 30, 50, 4),
     observation('obs-d2', SEED_IDS.pondD, '2026-09-01', 1.055, 31, 48, 3),
     observation('obs-d3', SEED_IDS.pondD, '2026-09-12', 1.074, 29, 46, 2),
-    observation('obs-d4', SEED_IDS.pondD, '2026-09-24', 1.092, 27, 44, 3),
+    observation('obs-d4', SEED_IDS.pondD, '2026-09-24', 1.102, 27, 44, 3),
     observation('obs-e1', SEED_IDS.pondE, '2026-08-24', 1.12, 28, 38, 2),
     observation('obs-e2', SEED_IDS.pondE, '2026-09-04', 1.146, 29, 36, 2),
   ];
@@ -128,20 +130,111 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // ---------------- 发运单（储运班账本，另记一本；调度室只选外送归属，改不了发运单） ----------------
+  const shippingOrders = buildShippingOrders(ponds);
+
+  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后；外送归属按池号接上发运单） ----------------
+  const orderIdByPond = new Map(shippingOrders.map((order) => [order.pondId, order.id]));
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({
+      id: 'schedule-a1',
+      pondId: SEED_IDS.pondA,
+      shippingOrderId: orderIdByPond.get(SEED_IDS.pondA) ?? '',
+      planDate: '2026-10-02',
+      targetDensity: 1.115,
+      volumeM3: 1200,
+      operator: '韩江',
+      state: '已排',
+      orderIndex: 1,
+      queueReason: '',
+    }),
+    wrap<Schedule>({
+      id: 'schedule-d1',
+      pondId: SEED_IDS.pondD,
+      shippingOrderId: orderIdByPond.get(SEED_IDS.pondD) ?? '',
+      planDate: '2026-10-04',
+      targetDensity: 1.098,
+      volumeM3: 1600,
+      operator: '王锐',
+      state: '已排',
+      orderIndex: 2,
+      queueReason: '',
+    }),
+    wrap<Schedule>({
+      id: 'schedule-b1',
+      pondId: SEED_IDS.pondB,
+      shippingOrderId: orderIdByPond.get(SEED_IDS.pondB) ?? '',
+      planDate: '2026-10-06',
+      targetDensity: 1.175,
+      volumeM3: 900,
+      operator: '韩江',
+      state: '走水中',
+      orderIndex: 3,
+      queueReason: '',
+    }),
+    wrap<Schedule>({
+      id: 'schedule-c1',
+      pondId: SEED_IDS.pondC,
+      shippingOrderId: orderIdByPond.get(SEED_IDS.pondC) ?? '',
+      planDate: '2026-10-12',
+      targetDensity: 1.255,
+      volumeM3: 600,
+      operator: '李文',
+      state: '待排',
+      orderIndex: 4,
+      queueReason: '',
+    }),
+    wrap<Schedule>({
+      id: 'schedule-e1',
+      pondId: SEED_IDS.pondE,
+      shippingOrderId: orderIdByPond.get(SEED_IDS.pondE) ?? '',
+      planDate: '2026-09-28',
+      targetDensity: 1.15,
+      volumeM3: 700,
+      operator: '王锐',
+      state: '已出卤',
+      orderIndex: 5,
+      queueReason: '',
+    }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shippingOrders], async () => {
     await db.ponds.bulkPut(ponds);
     await db.gates.bulkPut(gates);
     await db.observations.bulkPut(observations);
     await db.assays.bulkPut(assays);
+    await db.shippingOrders.bulkPut(shippingOrders);
     await db.schedules.bulkPut(schedules);
+  });
+}
+
+/**
+ * 按池构建储运班发运单（幂等：仅在发运单表为空时由播种 / v3 迁移调用）。
+ * 槽车运力 = 槽车数量 × 单车运力；南-05 已装车 750 m³，与已出卤 700 m³ 差 50 m³（超容差），
+ * 用于演示「累计外送量 vs 装车量」对账不符、摆出来等储运班复核。
+ */
+export function buildShippingOrders(ponds: Pond[]): ShippingOrder[] {
+  const plans: Record<string, { farm: string; volume: number; cars: number; perCar: number; loaded: number; shipDate: string }> = {
+    '北-01': { farm: '东罐区', volume: 1200, cars: 10, perCar: 120, loaded: 0, shipDate: '2026-10-02' },
+    '北-02': { farm: '西罐区', volume: 900, cars: 8, perCar: 120, loaded: 0, shipDate: '2026-10-06' },
+    '北-03': { farm: '西罐区', volume: 600, cars: 6, perCar: 110, loaded: 0, shipDate: '2026-10-12' },
+    '南-04': { farm: '东罐区', volume: 1600, cars: 12, perCar: 140, loaded: 0, shipDate: '2026-10-04' },
+    '南-05': { farm: '东罐区', volume: 800, cars: 7, perCar: 120, loaded: 750, shipDate: '2026-09-28' },
+  };
+  return ponds.map((pond, index) => {
+    const plan = plans[pond.code] ?? { farm: '东罐区', volume: 800, cars: 6, perCar: 120, loaded: 0, shipDate: '2026-10-01' };
+    return wrap<ShippingOrder>({
+      id: `so-${pond.id}`,
+      orderNo: `FY-2026-${String(index + 1).padStart(3, '0')}`,
+      pondId: pond.id,
+      volumeM3: plan.volume,
+      tankCarCount: plan.cars,
+      tankCarCapacityM3: plan.perCar,
+      loadedVolumeM3: plan.loaded,
+      tankFarm: plan.farm,
+      shipDate: plan.shipDate,
+      status: '有效',
+      note: plan.loaded > 0 ? `已装车 ${plan.loaded} m³，待与调度室对账` : '',
+    });
   });
 }

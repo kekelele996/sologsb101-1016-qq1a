@@ -88,7 +88,8 @@ sologsb101-1016/
 | `/gates` | `pages/GateConfig.tsx` | 串级走向与闸门配置：拓扑列表 + 开度就地编辑（滑块/数字），实时重算下游预计进水量 |
 | `/observations` | `pages/ObservationEntry.tsx` | 卤水日观测录入台：单条 + 批量粘贴录入，同池同日覆盖写入，蒸发量按经验公式自动估算 |
 | `/assays` | `pages/AssayEntry.tsx` | 离子组分分析：Li⁺/K⁺/Mg²⁺/Na⁺ 录入、自动达标判定（可人工覆盖）、SVG 组分曲线 |
-| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段 |
+| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段；推进出卤前按发运单与槽车运力核一遍，罐区容量不足时按池排队并写明还差多少方 |
+| `/shipping` | `pages/ShippingBoard.tsx` | 发运单管理（储运班账本）：发运单与槽车运力另记一本，新建/编辑/作废/改派别池，作废或改派把靠它排出的出卤退回待排；按池对账（累计外送量 vs 装车量，差过容差摆出来等储运班复核） |
 | `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、重置演示数据 |
 
 `/` 重定向到 `/ponds`，未匹配路径统一回落到 `/ponds`。
@@ -101,11 +102,14 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**新增 `shippingOrders` 发运单表（储运班账本）**，并写入升级迁移 ——
+    发运单表为空时按池补齐（`buildShippingOrders`），再**按池号回填走水计划的外送归属 `shippingOrderId`**，
+    旧版走水计划缺外送归属，升级后按池补上，**原顺序和状态留着**；同时补齐 `schedules.queueReason`。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -114,7 +118,8 @@ sologsb101-1016/
   | `gates` | id | fromPondId, toPondId, state, openingPct |
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
-  | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `schedules` | id | pondId, planDate, state, orderIndex, shippingOrderId |
+  | `shippingOrders` | id | orderNo, pondId, tankFarm, shipDate, status, createdAt, updatedAt |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -122,10 +127,11 @@ sologsb101-1016/
   * 4 条闸门串级（北-01→北-02→北-03、南-04→南-05、跨池系备用闸），1 条关闭用于验证开度联动；
   * 16 条卤水日观测（每池 2–4 条，密度随日期递增，`evapMm` 由经验公式生成）；
   * 6 条离子组分分析（覆盖达标 / 接近 / 未达标，其中 1 条为人工覆盖判定）；
-  * 5 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态）。
-  * 固定 id 如 `pond-north-01`、`pond-south-04` 可直接用于验证与二次开发。
+  * 5 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态，外送归属按池号接上发运单）；
+  * 5 条发运单（储运班账本，跨 2 个罐区，槽车运力 = 数量 × 单车运力；南-05 已装车 750 m³ 与已出卤 700 m³ 差 50 m³ 超容差，演示按池对账不符）。
+  * 固定 id 如 `pond-north-01`、`pond-south-04`、`so-pond-south-05` 可直接用于验证与二次开发。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的池系」这一界面偏好，不存业务数据。
-* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验与走水编排（同一 Dexie 事务内完成）。
+* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验、走水编排与发运单（同一 Dexie 事务内完成）。
 
 ---
 
@@ -157,3 +163,12 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+* **发运单与槽车运力核检**（`checkShipping`）：推进出卤前先按发运单和槽车运力核一遍——
+  外送归属发运单有效、槽车总运力（数量 × 单车运力）≥ 本次量、发运单剩余可装量（发运量 − 已装车）≥ 本次量、
+  去向罐区剩余容量 ≥ 本次量，四项全过才能出卤；任一不过则列出原因、不推进。
+* **按池排队**：密度到了但罐区容量不够时，按池排队并写明还差多少方（`shortfallM3 = 本次量 − 罐区剩余容量`），
+  排队期间**池里水位和目标密度这轮不动**（不回写池阶段 / 密度），排队原因记在 `schedules.queueReason`。
+* **按池对账**（`reconcileByPond`）：同一口池累计外送量（已出卤走水计划的计划量之和）要跟储运班装车量（发运单已装车量之和）按池号对账，
+  差过容差（相差 > 5% 且绝对差 > 1 m³）就把两边数字摆出来等储运班复核；**调度室改不了发运单**。
+* **作废 / 改派退回待排**：储运班把发运单作废或改派别池时，在同一事务内把靠它排出的出卤（引用该单且未出卤的走水计划）退回「待排」、
+  清掉外送归属与排队原因，等调度员重排；已出卤（已装完）的照旧。

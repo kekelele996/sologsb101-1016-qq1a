@@ -15,8 +15,10 @@ import {
   removeSchedule,
   reorderSchedules,
 } from '../utils/db';
+import { checkShipping, densityReached } from '../utils/brine';
 import { nowIso, uuid } from '../utils/id';
 import { usePondStore } from './pondStore';
+import { useShippingStore } from './shippingStore';
 
 /** 走水编排筛选条件 */
 export interface ScheduleFilters {
@@ -78,12 +80,14 @@ function createScheduleStore() {
     const row: Schedule = {
       id: uuid('schedule'),
       pondId: draft.pondId,
+      shippingOrderId: draft.shippingOrderId,
       planDate: draft.planDate,
       targetDensity: draft.targetDensity,
       volumeM3: draft.volumeM3,
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      queueReason: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: 2,
@@ -99,6 +103,7 @@ function createScheduleStore() {
     await putSchedule({
       ...existing,
       pondId: draft.pondId,
+      shippingOrderId: draft.shippingOrderId,
       planDate: draft.planDate,
       targetDensity: draft.targetDensity,
       volumeM3: draft.volumeM3,
@@ -120,17 +125,59 @@ function createScheduleStore() {
     const index = SCHEDULE_STATE_FLOW.indexOf(existing.state);
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
+
+    // 推进出卤前先按发运单和槽车运力核一遍：密度到了但罐区容量不够，就按池排队，
+    // 写明还差多少方，池里水位和目标密度这轮不动（不回写池阶段 / 密度）。
+    if (next === '已出卤') {
+      const pondStore = usePondStore();
+      const shippingStore = useShippingStore();
+      const pond = pondStore.state.ponds.find((item) => item.id === existing.pondId);
+      const stat = pondStore.statOf(existing.pondId);
+      const currentDensity = stat.currentDensity;
+
+      if (!densityReached(currentDensity, existing.targetDensity)) {
+        setState(
+          'lastMessage',
+          `密度未达目标：当前 ${currentDensity || '—'} < 目标 ${existing.targetDensity} g/cm³，不能出卤`,
+        );
+        return null;
+      }
+
+      const check = checkShipping(existing, shippingStore.state.rows);
+      if (!check.canDeliver) {
+        if (check.farmShortfall && check.order !== null) {
+          await db.schedules.update(scheduleId, {
+            queueReason: `${check.order.tankFarm}容量不足，还差 ${check.shortfallM3} m³`,
+            updatedAt: nowIso(),
+          });
+          setState(
+            'lastMessage',
+            `已按池排队：${pond?.code ?? ''} 密度已达目标，但 ${check.order.tankFarm} 容量不足，还差 ${check.shortfallM3} m³；池水位与目标密度本轮不动`,
+          );
+          return null;
+        }
+        setState('lastMessage', `暂不能出卤：${check.reasons.join('；')}`);
+        return null;
+      }
+
+      // 核检通过：清掉排队原因，回写池阶段与实际密度
+      await db.schedules.update(scheduleId, { queueReason: '', updatedAt: nowIso() });
+      const actualDensity = currentDensity > 0 ? currentDensity : existing.targetDensity;
+      await advanceScheduleState(scheduleId, next, actualDensity);
+      await pondStore.refreshCounts();
+      setState(
+        'lastMessage',
+        `已出卤：池阶段已推进，实际密度回写为 ${actualDensity} g/cm³`,
+      );
+      return next;
+    }
+
     const pondStore = usePondStore();
     const stat = pondStore.statOf(existing.pondId);
     const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
     await advanceScheduleState(scheduleId, next, actualDensity);
     await pondStore.refreshCounts();
-    setState(
-      'lastMessage',
-      next === '已出卤'
-        ? `已出卤：池阶段已推进，实际密度回写为 ${actualDensity} g/cm³`
-        : `状态已推进为「${next}」`,
-    );
+    setState('lastMessage', `状态已推进为「${next}」`);
     return next;
   }
 

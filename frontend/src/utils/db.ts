@@ -11,15 +11,16 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule, ScheduleState } from '../types/schedule';
+import type { ShippingOrder, ShippingOrderDraft } from '../types/shippingOrder';
 import { estimateEvapMm } from './brine';
 import { nowIso } from './id';
-import { seedDatabase } from './seed';
+import { buildShippingOrders, seedDatabase } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
 export const ROW_REVISION = 2;
@@ -30,6 +31,7 @@ class BrinePondDatabase extends Dexie {
   observations!: Table<Observation, string>;
   assays!: Table<Assay, string>;
   schedules!: Table<Schedule, string>;
+  shippingOrders!: Table<ShippingOrder, string>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +46,7 @@ class BrinePondDatabase extends Dexie {
     });
 
     // ---------- v2：新增 evapMm 字段，并为旧记录补齐默认值 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
         gates: 'id, fromPondId, toPondId, state, openingPct',
@@ -90,6 +92,38 @@ class BrinePondDatabase extends Dexie {
           }
         });
       });
+
+    // ---------- v3：新增发运单（储运班账本），走水计划补外送归属 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, planDate, state, orderIndex, shippingOrderId',
+        shippingOrders: 'id, orderNo, pondId, tankFarm, shipDate, status, createdAt, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 5：建立储运班发运单账本（若为空则按池补齐），再按池号回填走水计划的外送归属。
+        // 旧版走水计划缺外送归属，升级后按池补上，原顺序和状态留着。
+        const shippingTable = tx.table('shippingOrders');
+        if ((await shippingTable.count()) === 0) {
+          const ponds = (await tx.table('ponds').toArray()) as Pond[];
+          if (ponds.length > 0) {
+            await shippingTable.bulkPut(buildShippingOrders(ponds));
+          }
+        }
+        const orders = (await shippingTable.toArray()) as ShippingOrder[];
+        await tx.table('schedules').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.shippingOrderId === 'string' && row.shippingOrderId !== '') return;
+          const pondId = typeof row.pondId === 'string' ? row.pondId : '';
+          const match =
+            orders.find((order) => order.pondId === pondId && order.status === '有效') ??
+            orders.find((order) => order.pondId === pondId);
+          row.shippingOrderId = match ? match.id : '';
+          if (typeof row.queueReason !== 'string') row.queueReason = '';
+        });
+      });
   }
 }
 
@@ -127,15 +161,16 @@ export async function putPond(row: Pond): Promise<void> {
   await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
 }
 
-/** 删除蒸发池，并级联清理相关闸门、观测、化验与走水计划 */
+/** 删除蒸发池，并级联清理相关闸门、观测、化验、走水计划与发运单 */
 export async function removePond(id: string): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shippingOrders], async () => {
     const gates = await db.gates.toArray();
     const related = gates.filter((gate) => gate.fromPondId === id || gate.toPondId === id).map((gate) => gate.id);
     if (related.length > 0) await db.gates.bulkDelete(related);
     await db.observations.where('pondId').equals(id).delete();
     await db.assays.where('pondId').equals(id).delete();
     await db.schedules.where('pondId').equals(id).delete();
+    await db.shippingOrders.where('pondId').equals(id).delete();
     await db.ponds.delete(id);
   });
 }
@@ -274,6 +309,48 @@ export async function advanceScheduleState(scheduleId: string, next: ScheduleSta
   await db.schedules.update(scheduleId, { state: next, updatedAt: nowIso() });
 }
 
+/* ------------------------------ 发运单（储运班账本） ------------------------------ */
+
+export async function listShippingOrders(): Promise<ShippingOrder[]> {
+  const rows = await db.shippingOrders.toArray();
+  return rows.sort((a, b) => a.shipDate.localeCompare(b.shipDate) || a.orderNo.localeCompare(b.orderNo));
+}
+
+export async function putShippingOrder(row: ShippingOrder): Promise<void> {
+  await db.shippingOrders.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeShippingOrder(id: string): Promise<void> {
+  await db.shippingOrders.delete(id);
+}
+
+/**
+ * 储运班作废发运单或改派别池：靠它排出的出卤退回待排、等调度员重排，已装完的照旧。
+ * 在同一事务内更新发运单，并把引用该单且未出卤的走水计划退回「待排」、清掉外送归属与排队原因。
+ */
+export async function updateShippingOrderWithCascade(
+  id: string,
+  draft: ShippingOrderDraft,
+  previous: ShippingOrder | undefined,
+): Promise<void> {
+  await db.transaction('rw', db.shippingOrders, db.schedules, async () => {
+    await db.shippingOrders.update(id, { ...draft, updatedAt: nowIso() });
+    const voided = draft.status === '作废' && previous?.status === '有效';
+    const reassigned = previous !== undefined && draft.pondId !== previous.pondId;
+    if (!voided && !reassigned) return;
+    const affected = await db.schedules.where('shippingOrderId').equals(id).toArray();
+    for (const schedule of affected) {
+      if (schedule.state === '已出卤') continue; // 已装完的照旧
+      await db.schedules.update(schedule.id, {
+        state: '待排',
+        shippingOrderId: '',
+        queueReason: voided ? '发运单已作废，退回待排等重排' : '发运单改派别池，退回待排等重排',
+        updatedAt: nowIso(),
+      });
+    }
+  });
+}
+
 /* ---------------------------- 整库快照 ---------------------------- */
 
 export interface DatabaseSnapshot {
@@ -285,56 +362,72 @@ export interface DatabaseSnapshot {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  shippingOrders: ShippingOrder[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, shippingOrders] = await Promise.all([
     db.ponds.toArray(),
     db.gates.toArray(),
     db.observations.toArray(),
     db.assays.toArray(),
     db.schedules.toArray(),
+    db.shippingOrders.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), ponds, gates, observations, assays, schedules };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    ponds,
+    gates,
+    observations,
+    assays,
+    schedules,
+    shippingOrders,
+  };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shippingOrders], async () => {
     await Promise.all([
       db.ponds.clear(),
       db.gates.clear(),
       db.observations.clear(),
       db.assays.clear(),
       db.schedules.clear(),
+      db.shippingOrders.clear(),
     ]);
     await db.ponds.bulkPut(snapshot.ponds.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.gates.bulkPut(snapshot.gates.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.schedules.bulkPut(snapshot.schedules.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.shippingOrders.bulkPut((snapshot.shippingOrders ?? []).map((row) => ({ ...row, revision: ROW_REVISION })));
   });
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shippingOrders], async () => {
     await Promise.all([
       db.ponds.clear(),
       db.gates.clear(),
       db.observations.clear(),
       db.assays.clear(),
       db.schedules.clear(),
+      db.shippingOrders.clear(),
     ]);
   });
   await seedDatabase();
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, shippingOrders] = await Promise.all([
     db.ponds.count(),
     db.gates.count(),
     db.observations.count(),
     db.assays.count(),
     db.schedules.count(),
+    db.shippingOrders.count(),
   ]);
-  return { ponds, gates, observations, assays, schedules };
+  return { ponds, gates, observations, assays, schedules, shippingOrders };
 }
