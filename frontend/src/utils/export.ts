@@ -8,7 +8,11 @@ import type { Pond } from '../types/pond';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { ShipmentOrder } from '../types/shipment';
+import type { TankFarm } from '../types/truck';
+import { RECON_TOLERANCE_M3 } from '../types/recon';
 import { effectiveVerdict, pondVolumeM3, round1 } from './brine';
+import { tankFarmOccupiedM3 } from './dispatch';
 import { stampSuffix } from './id';
 
 /** 触发浏览器下载 */
@@ -71,11 +75,23 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
+  // v3 新增的储运外送台账对旧存档缺省为空，导入后由迁移/播种逻辑接管
+  const snapshot = data as DatabaseSnapshot;
+  snapshot.shipmentOrders = Array.isArray(data.shipmentOrders) ? data.shipmentOrders : [];
+  snapshot.tankTrucks = Array.isArray(data.tankTrucks) ? data.tankTrucks : [];
+  snapshot.tankfarm = Array.isArray(data.tankfarm) ? data.tankfarm : [];
+  snapshot.reconReviews = Array.isArray(data.reconReviews) ? data.reconReviews : [];
+  return { ok: true, message: '存档校验通过。', snapshot };
 }
 
 /** 生成晒程进度汇总 CSV */
-export function buildProgressCsv(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
+export function buildProgressCsv(
+  ponds: Pond[],
+  observations: Observation[],
+  assays: Assay[],
+  schedules: Schedule[],
+  orders: ShipmentOrder[],
+): string {
   const header = [
     '池号',
     '池系',
@@ -92,6 +108,9 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     '最近判定',
     '走水计划数',
     '已完成出卤数',
+    '累计外送(m³)',
+    '储运累计装车(m³)',
+    '对账差(m³)',
   ];
   const lines: string[] = [header.map(csvCell).join(',')];
   ponds.forEach((pond) => {
@@ -100,6 +119,14 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
     const pondSchedules = schedules.filter((row) => row.pondId === pond.id);
+    const dischargedM3 = round1(
+      pondSchedules.filter((row) => row.state === '已出卤').reduce((acc, row) => acc + row.volumeM3, 0),
+    );
+    const loadedM3 = round1(
+      orders
+        .filter((row) => row.pondId === pond.id && row.status !== '已作废')
+        .reduce((acc, row) => acc + row.loadedVolumeM3, 0),
+    );
     lines.push(
       [
         pond.code,
@@ -117,6 +144,9 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
         latestAssay === null ? '—' : effectiveVerdict(latestAssay),
         pondSchedules.length,
         pondSchedules.filter((row) => row.state === '已出卤').length,
+        dischargedM3,
+        loadedM3,
+        round1(dischargedM3 - loadedM3),
       ]
         .map(csvCell)
         .join(','),
@@ -131,9 +161,10 @@ export function exportProgressCsvFile(
   observations: Observation[],
   assays: Assay[],
   schedules: Schedule[],
+  orders: ShipmentOrder[],
 ): string {
   const filename = `盐湖晒程进度汇总-${stampSuffix()}.csv`;
-  download(filename, buildProgressCsv(ponds, observations, assays, schedules), 'text/csv;charset=utf-8');
+  download(filename, buildProgressCsv(ponds, observations, assays, schedules, orders), 'text/csv;charset=utf-8');
   return filename;
 }
 
@@ -151,7 +182,14 @@ export async function copyText(text: string): Promise<boolean> {
 }
 
 /** 生成晒程调度通报纯文本 */
-export function buildBriefingText(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
+export function buildBriefingText(
+  ponds: Pond[],
+  observations: Observation[],
+  assays: Assay[],
+  schedules: Schedule[],
+  orders: ShipmentOrder[],
+  tankFarm: TankFarm | null,
+): string {
   const lines: string[] = [`【盐湖晒程调度通报】共 ${ponds.length} 口蒸发池`];
   ponds.forEach((pond) => {
     const pondObs = observations.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
@@ -167,5 +205,22 @@ export function buildBriefingText(ponds: Pond[], observations: Observation[], as
       }，待完成走水 ${pending} 条`,
     );
   });
+  // 外送与罐区：占用 = 累计已出卤 − 累计已装车；对账超差池数一并通报
+  const occupied = tankFarmOccupiedM3(schedules, orders);
+  const total = tankFarm?.totalCapacityM3 ?? 0;
+  const overCount = ponds.filter((pond) => {
+    const discharged = schedules
+      .filter((row) => row.pondId === pond.id && row.state === '已出卤')
+      .reduce((acc, row) => acc + row.volumeM3, 0);
+    const loaded = orders
+      .filter((row) => row.pondId === pond.id && row.status !== '已作废')
+      .reduce((acc, row) => acc + row.loadedVolumeM3, 0);
+    return Math.abs(round1(discharged - loaded)) > RECON_TOLERANCE_M3;
+  }).length;
+  lines.push(
+    `· 罐区（${tankFarm?.name ?? '未设置'}）：占用 ${occupied} m³ / 总容量 ${total} m³，剩余 ${round1(
+      Math.max(0, total - occupied),
+    )} m³；对账超差 ${overCount} 口池（容差 ${RECON_TOLERANCE_M3} m³）`,
+  );
   return lines.join('\n');
 }

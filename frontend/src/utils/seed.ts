@@ -1,7 +1,8 @@
 /**
  * 演示数据播种（幂等）
  * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排
- * 所有 id 固定，保证 /gates、/observations、/assays、/schedules 打开就有真实串级与数据。
+ * 外送链路：发运单 / 槽车 / 罐区 ↔ 走水编排（外送归属、罐区排队、按池对账）
+ * 所有 id 固定，保证 /gates、/observations、/assays、/schedules、/shipments 打开就有真实串级与数据。
  */
 import { db, ROW_REVISION } from './db';
 import type { Pond } from '../types/pond';
@@ -9,6 +10,9 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { ShipmentOrder } from '../types/shipment';
+import type { TankFarm, TankTruck } from '../types/truck';
+import { TANK_FARM_ID } from '../types/truck';
 import { autoVerdict, estimateEvapMm } from './brine';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
@@ -128,20 +132,49 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
-  const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+  // ---------------- 发运单（储运班台账，每池一张，覆盖待发运 / 装运中） ----------------
+  const shipmentOrders: ShipmentOrder[] = [
+    wrap<ShipmentOrder>({ id: 'so-1001', code: 'FY-2026-1001', pondId: SEED_IDS.pondB, plannedVolumeM3: 1000, loadedVolumeM3: 0, status: '待发运', carrier: '盐湖物流一队', note: '钾盐卤外送' }),
+    wrap<ShipmentOrder>({ id: 'so-1002', code: 'FY-2026-1002', pondId: SEED_IDS.pondE, plannedVolumeM3: 700, loadedVolumeM3: 400, status: '装运中', carrier: '盐湖物流二队', note: '已装 400 m³，剩余待装' }),
+    wrap<ShipmentOrder>({ id: 'so-1003', code: 'FY-2026-1003', pondId: SEED_IDS.pondA, plannedVolumeM3: 1300, loadedVolumeM3: 0, status: '待发运', carrier: '盐湖物流一队', note: '' }),
+    wrap<ShipmentOrder>({ id: 'so-1004', code: 'FY-2026-1004', pondId: SEED_IDS.pondD, plannedVolumeM3: 1600, loadedVolumeM3: 0, status: '待发运', carrier: '盐湖物流三队', note: '' }),
+    wrap<ShipmentOrder>({ id: 'so-1005', code: 'FY-2026-1005', pondId: SEED_IDS.pondC, plannedVolumeM3: 650, loadedVolumeM3: 0, status: '待发运', carrier: '盐湖物流二队', note: '锂盐卤精送' }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await db.ponds.bulkPut(ponds);
-    await db.gates.bulkPut(gates);
-    await db.observations.bulkPut(observations);
-    await db.assays.bulkPut(assays);
-    await db.schedules.bulkPut(schedules);
-  });
+  // ---------------- 槽车（可用日运力 1050 m³，1 辆维修中不计） ----------------
+  const tankTrucks: TankTruck[] = [
+    wrap<TankTruck>({ id: 'truck-1', plateNo: '青A·D201', capacityM3: 60, tripsPerDay: 6, status: '可用' }),
+    wrap<TankTruck>({ id: 'truck-2', plateNo: '青A·D202', capacityM3: 60, tripsPerDay: 6, status: '可用' }),
+    wrap<TankTruck>({ id: 'truck-3', plateNo: '青A·D305', capacityM3: 55, tripsPerDay: 6, status: '可用' }),
+    wrap<TankTruck>({ id: 'truck-4', plateNo: '青B·T107', capacityM3: 45, tripsPerDay: 4, status: '维修中' }),
+  ];
+
+  // ---------------- 罐区（总容量 800 m³；占用 = 已出卤 700 − 已装车 400 = 300） ----------------
+  const tankfarm: TankFarm[] = [
+    wrap<TankFarm>({ id: TANK_FARM_ID, name: '成品卤罐区', totalCapacityM3: 800 }),
+  ];
+
+  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后；外送归属按池接上发运单） ----------------
+  const schedules: Schedule[] = [
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1, shipmentOrderId: 'so-1003', queuedForCapacity: false, shortfallM3: 0 }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2, shipmentOrderId: 'so-1004', queuedForCapacity: false, shortfallM3: 0 }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3, shipmentOrderId: 'so-1001', queuedForCapacity: false, shortfallM3: 0 }),
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4, shipmentOrderId: 'so-1005', queuedForCapacity: false, shortfallM3: 0 }),
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5, shipmentOrderId: 'so-1002', queuedForCapacity: false, shortfallM3: 0 }),
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shipmentOrders, db.tankTrucks, db.tankfarm],
+    async () => {
+      await db.ponds.bulkPut(ponds);
+      await db.gates.bulkPut(gates);
+      await db.observations.bulkPut(observations);
+      await db.assays.bulkPut(assays);
+      await db.schedules.bulkPut(schedules);
+      await db.shipmentOrders.bulkPut(shipmentOrders);
+      await db.tankTrucks.bulkPut(tankTrucks);
+      await db.tankfarm.bulkPut(tankfarm);
+    },
+  );
 }

@@ -27,6 +27,12 @@ export interface Schedule {
   state: ScheduleState
   /** 手工拖拽后的排序序号，越小越先走水 */
   orderIndex: number
+  /** 外送归属：关联的发运单 id（v3 新增；null 表示未关联，待调度员重排时核单接上） */
+  shipmentOrderId: string | null
+  /** 是否因罐区容量不足按池排队中（v3 新增；排队期间水位与目标密度不动） */
+  queuedForCapacity: boolean
+  /** 排队时罐区还差多少方（m³，v3 新增） */
+  shortfallM3: number
   createdAt: string
   updatedAt: string
   revision: number
@@ -41,4 +47,6 @@ export interface ScheduleDraft {
   operator: string
   state: ScheduleState
   orderIndex: number
+  /** 外送归属（发运单 id），null 表示未关联 */
+  shipmentOrderId: string | null
 }

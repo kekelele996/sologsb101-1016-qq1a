@@ -1,7 +1,8 @@
 /**
  * /schedules 走水与出卤编排
  * 按日期排序、拖拽调整走水先后顺序、逐条推进状态；出卤完成回写池阶段与实际密度。
- * 消费模型：Schedule、Gate、Assay；复用组件：<FilterBar>、<EmptyPanel>、<StatBadge>
+ * 推进出卤前先按发运单与槽车运力核单；罐区不足按池排队并写明还差多少方，本轮水位与目标密度不动。
+ * 消费模型：Schedule、Gate、Assay、ShipmentOrder；复用组件：<FilterBar>、<EmptyPanel>、<StatBadge>
  */
 import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
 import { createStore } from 'solid-js/store';
@@ -12,8 +13,10 @@ import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
+import { useShipmentStore } from '../stores/shipmentStore';
 import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
 import { effectiveVerdict } from '../utils/brine';
+import { reconcileByPond } from '../utils/dispatch';
 import { today } from '../utils/id';
 
 const INPUT =
@@ -40,12 +43,14 @@ function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
     operator: '',
     state: '待排',
     orderIndex,
+    shipmentOrderId: null,
   };
 }
 
 export default function ScheduleBoard() {
   const pondStore = usePondStore();
   const scheduleStore = useScheduleStore();
+  const shipmentStore = useShipmentStore();
 
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
@@ -62,6 +67,20 @@ export default function ScheduleBoard() {
     const pond = pondOf(pondId);
     return pond === null ? '（池已删除）' : `${pond.code} · ${pond.seriesName}`;
   };
+
+  /** 外送归属发运单号（调度室只读，发运单本身由储运班维护） */
+  const orderCodeOf = (shipmentOrderId: string | null): string => {
+    if (shipmentOrderId === null) return '';
+    return shipmentStore.state.orders.find((row) => row.id === shipmentOrderId)?.code ?? '（单已删除）';
+  };
+
+  /** 编辑对话框里可选的发运单：同池有效单 + 当前已关联单（避免丢归属） */
+  const orderOptions = createMemo(() => {
+    const currentId = draft.shipmentOrderId;
+    return shipmentStore.state.orders.filter(
+      (row) => (row.pondId === draft.pondId && row.status !== '已作废') || row.id === currentId,
+    );
+  });
 
   const ordered = createMemo<Schedule[]>(() =>
     [...scheduleStore.state.rows].sort((a, b) => a.orderIndex - b.orderIndex || a.planDate.localeCompare(b.planDate)),
@@ -86,11 +105,19 @@ export default function ScheduleBoard() {
 
   const stats = createMemo(() => {
     const list = ordered();
+    const reconPending = reconcileByPond(
+      pondStore.state.ponds,
+      list,
+      shipmentStore.state.orders,
+      shipmentStore.state.reviews,
+    ).filter((row) => row.overTolerance && !row.reviewed).length;
     return {
       total: list.length,
       pending: list.filter((row) => row.state === '待排').length,
       running: list.filter((row) => row.state === '走水中').length,
       done: list.filter((row) => row.state === '已出卤').length,
+      queued: list.filter((row) => row.queuedForCapacity).length,
+      reconPending,
       volume: Math.round(list.reduce((acc, row) => acc + row.volumeM3, 0) * 10) / 10,
       donePct: list.length === 0 ? 0 : Math.round((list.filter((row) => row.state === '已出卤').length / list.length) * 1000) / 10,
     };
@@ -113,6 +140,7 @@ export default function ScheduleBoard() {
       operator: row.operator,
       state: row.state,
       orderIndex: row.orderIndex,
+      shipmentOrderId: row.shipmentOrderId,
     });
     setDialogOpen(true);
   };
@@ -160,6 +188,20 @@ export default function ScheduleBoard() {
         <StatBadge label="待排" value={stats().pending} suffix="条" tone="default" />
         <StatBadge label="走水中" value={stats().running} suffix="条" tone="warning" />
         <StatBadge label="已出卤" value={stats().done} suffix="条" tone="success" />
+        <StatBadge
+          label="罐区排队"
+          value={stats().queued}
+          suffix="条"
+          tone={stats().queued > 0 ? 'danger' : 'default'}
+          hint="密度到了但罐区容量不足，按池排队等储运班装车腾容"
+        />
+        <StatBadge
+          label="对账待复核"
+          value={stats().reconPending}
+          suffix="口池"
+          tone={stats().reconPending > 0 ? 'danger' : 'success'}
+          hint="累计外送与储运装车差值超容差，等储运班复核；发运单只能由储运班改"
+        />
         <StatBadge label="计划总量" value={stats().volume} suffix="m³" tone="info" />
         <StatBadge label="出卤完成率" value={`${stats().donePct}%`} percent={stats().donePct} tone="success" />
       </div>
@@ -237,6 +279,12 @@ export default function ScheduleBoard() {
                     <p class="text-xs text-slate-500">
                       计划日期 {row.planDate} · 调度员 {row.operator === '' ? '未填写' : row.operator}
                     </p>
+                    <p class="mt-0.5 text-xs">
+                      <span class="text-slate-400">外送归属 </span>
+                      <span class={row.shipmentOrderId === null ? 'text-amber-600' : 'font-medium text-brine-700'}>
+                        {row.shipmentOrderId === null ? '未关联发运单' : orderCodeOf(row.shipmentOrderId)}
+                      </span>
+                    </p>
                   </div>
                   <div class="flex items-center gap-2">
                     <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
@@ -269,16 +317,25 @@ export default function ScheduleBoard() {
                     </p>
                   </div>
                   <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                  <Show when={row.queuedForCapacity}>
+                    <span
+                      class="rounded border border-rose-300 bg-rose-50 px-2 py-0.5 text-[11px] text-rose-600"
+                      title="密度到了但罐区容量不足，按池排队等储运班装车腾容；本轮水位与目标密度不动"
+                    >
+                      罐区排队 · 还差 {row.shortfallM3} m³
+                    </span>
+                  </Show>
                   <div class="flex flex-wrap items-center gap-2">
                     <button
                       class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
                       disabled={row.state === '已出卤'}
-                      onClick={async () => {
-                        const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
+                      title={row.state === '走水中' ? '出卤前按发运单与槽车运力核单，罐区不足则按池排队' : undefined}
+                      onClick={() => {
+                        // 核单未通过 / 罐区排队 / 推进成功，原因与结果都由 store 写进 lastMessage
+                        void scheduleStore.advance(row.id);
                       }}
                     >
-                      {nextStateLabel(row.state)}
+                      {row.state === '走水中' && row.queuedForCapacity ? '重试出卤' : nextStateLabel(row.state)}
                     </button>
                     <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
                       编辑
@@ -367,6 +424,23 @@ export default function ScheduleBoard() {
             </select>
           </label>
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>外送归属（发运单，储运班台账）</span>
+            <select
+              class={INPUT}
+              value={draft.shipmentOrderId ?? ''}
+              onChange={(event) => setDraft('shipmentOrderId', event.currentTarget.value === '' ? null : event.currentTarget.value)}
+            >
+              <option value="">未关联（出卤核单时自动匹配同池有效单）</option>
+              <For each={orderOptions()}>
+                {(order) => (
+                  <option value={order.id}>
+                    {order.code} · 剩余 {Math.max(0, order.plannedVolumeM3 - order.loadedVolumeM3)} m³ · {order.status}
+                  </option>
+                )}
+              </For>
+            </select>
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>排序序号（越小越先走水）</span>
             <input
               type="number"
@@ -379,7 +453,8 @@ export default function ScheduleBoard() {
           </label>
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
-          状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。
+          推进「已出卤」前会按发运单剩余量与槽车运力核单；罐区容量不足时按池排队并写明还差多少方，本轮池水位与目标密度不动。
+          状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。发运单本身只能由储运班在「储运发运」页维护。
         </p>
       </AppDialog>
 

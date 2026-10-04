@@ -8,12 +8,16 @@ import { liveQuery } from 'dexie';
 import type { Schedule, ScheduleDraft, ScheduleState } from '../types/schedule';
 import { SCHEDULE_STATE_FLOW } from '../types/schedule';
 import {
+  ROW_REVISION,
   advanceScheduleState,
+  applyDischarge,
   db,
   initDatabase,
+  markScheduleQueued,
   putSchedule,
   removeSchedule,
   reorderSchedules,
+  verifyDischarge,
 } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
 import { usePondStore } from './pondStore';
@@ -84,9 +88,12 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      shipmentOrderId: draft.shipmentOrderId,
+      queuedForCapacity: false,
+      shortfallM3: 0,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSchedule(row);
     setState('lastMessage', `已新建走水计划：${row.planDate}`);
@@ -105,6 +112,7 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      shipmentOrderId: draft.shipmentOrderId,
     });
     setState('lastMessage', '走水计划已更新');
   }
@@ -121,16 +129,35 @@ function createScheduleStore() {
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
     const pondStore = usePondStore();
-    const stat = pondStore.statOf(existing.pondId);
-    const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
-    await advanceScheduleState(scheduleId, next, actualDensity);
+    if (next === '已出卤') {
+      // 推进出卤前先按发运单与槽车运力核一遍；罐区不够则按池排队，本轮水位与目标密度不动
+      const check = await verifyDischarge(scheduleId);
+      if (check === null) return null;
+      if (check.action === 'block') {
+        setState('lastMessage', `出卤核单未通过：${check.blockers.join('；')}`);
+        return null;
+      }
+      if (check.action === 'queue') {
+        await markScheduleQueued(scheduleId, check.shortfallM3);
+        setState(
+          'lastMessage',
+          `罐区容量不足：已按池排队，还差 ${check.shortfallM3} m³；本轮池水位与目标密度不动，等储运班装车腾容后重试`,
+        );
+        return null;
+      }
+      const stat = pondStore.statOf(existing.pondId);
+      const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
+      await applyDischarge(scheduleId, actualDensity, check.matchedOrderId);
+      await pondStore.refreshCounts();
+      setState(
+        'lastMessage',
+        `已出卤：核单通过（发运单 ${check.matchedOrderCode}），池阶段已推进，实际密度回写为 ${actualDensity} g/cm³`,
+      );
+      return next;
+    }
+    await advanceScheduleState(scheduleId, next, 0);
     await pondStore.refreshCounts();
-    setState(
-      'lastMessage',
-      next === '已出卤'
-        ? `已出卤：池阶段已推进，实际密度回写为 ${actualDensity} g/cm³`
-        : `状态已推进为「${next}」`,
-    );
+    setState('lastMessage', `状态已推进为「${next}」`);
     return next;
   }
 

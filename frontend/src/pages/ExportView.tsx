@@ -7,9 +7,11 @@ import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
+import { useShipmentStore } from '../stores/shipmentStore';
 import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
 import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
-import { effectiveVerdict } from '../utils/brine';
+import { effectiveVerdict, round1 } from '../utils/brine';
+import { availableTruckCapacityM3, tankFarmOccupiedM3 } from '../utils/dispatch';
 
 const BTN_GHOST =
   'rounded-md border border-slate-300 bg-white px-3.5 py-1.5 text-sm text-slate-700 transition hover:bg-slate-100';
@@ -17,6 +19,7 @@ const BTN_DANGER = 'rounded-md bg-rose-600 px-3.5 py-1.5 text-sm font-medium tex
 
 export default function ExportView() {
   const store = usePondStore();
+  const shipmentStore = useShipmentStore();
   const [message, setMessage] = createSignal('');
   const [resetOpen, setResetOpen] = createSignal(false);
 
@@ -29,19 +32,26 @@ export default function ExportView() {
     const observations = store.state.observations;
     const assays = store.state.assays;
     const schedules = store.state.schedules;
+    const orders = shipmentStore.state.orders;
     const passCount = assays.filter((row) => effectiveVerdict(row) === '达标').length;
     const done = schedules.filter((row) => row.state === '已出卤').length;
     const readyPonds = new Set(assays.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
+    const farm = shipmentStore.state.tankFarm;
+    const farmTotal = farm?.totalCapacityM3 ?? 0;
+    const occupied = tankFarmOccupiedM3(schedules, orders);
     return {
       ponds: ponds.length,
       observations: observations.length,
       assays: assays.length,
       gates: store.state.gates.length,
       schedules: schedules.length,
+      orders: orders.length,
       passCount,
       passPct: assays.length === 0 ? 0 : Math.round((passCount / assays.length) * 1000) / 10,
       donePct: schedules.length === 0 ? 0 : Math.round((done / schedules.length) * 1000) / 10,
       readyPonds,
+      farmRemainingM3: round1(Math.max(0, farmTotal - occupied)),
+      truckCapacityM3: availableTruckCapacityM3(shipmentStore.state.trucks),
     };
   });
 
@@ -57,6 +67,7 @@ export default function ExportView() {
       store.state.observations,
       store.state.assays,
       store.state.schedules,
+      shipmentStore.state.orders,
     );
     setMessage(`已导出晒程进度汇总 ${filename}`);
   };
@@ -67,6 +78,8 @@ export default function ExportView() {
       store.state.observations,
       store.state.assays,
       store.state.schedules,
+      shipmentStore.state.orders,
+      shipmentStore.state.tankFarm,
     );
     const ok = await copyText(text);
     setMessage(ok ? '晒程调度通报已复制到剪贴板' : '当前浏览器不支持剪贴板写入，请手动复制');
@@ -108,12 +121,21 @@ export default function ExportView() {
         />
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
+        <StatBadge label="发运单" value={summary().orders} suffix="张" tone="info" />
+        <StatBadge
+          label="罐区剩余容量"
+          value={summary().farmRemainingM3}
+          suffix="m³"
+          tone={summary().farmRemainingM3 <= 0 ? 'danger' : 'success'}
+          hint="占用 = 累计已出卤 − 累计已装车；不足时出卤按池排队"
+        />
+        <StatBadge label="槽车可用运力" value={summary().truckCapacityM3} suffix="m³/日" tone="default" />
         <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm，v3 接入储运外送台账"
         />
       </div>
 
